@@ -37,7 +37,7 @@ unzip model_backup.zip -d .
 ### Lexical datasets
 Before anything, you might want to create datasets in lexicons instead of in ids. For example, for the train file of icews14:
 ```
-python ./data_utils/id_words.py --file_to_convert ./data/icews14/train.txt --path_output ./data/processed_new/icews14/train.txt --dataset icews14 --period 24
+uv run ./data_utils/id_words.py --file_to_convert ./data/icews14/train.txt --path_output ./data/processed_new/icews14/train.txt --dataset icews14 --period 24
 ```
 Rules learning parameters:
 - **-f** **file_to_convert**, input path to a certain file.
@@ -72,6 +72,8 @@ Find the file name of rule bank json (in ./output) and run from the folder GenTK
 ```
 cd GenTKG
 python3 ./data_utils/retrieve.py --name_of_rules_file name_rules.json --dataset icews14
+uv run ./data_utils/retrieve.py --name_of_rules_file llm-da-rules.json --dataset icews14 
+uv run ./data_utils/retrieve.py --name_of_rules_file 080823105650_r[1,2,3]_n200_exp_s12_rules.json --dataset icews14 
 ```
 An example for icews18 would be like:
 ```
@@ -139,7 +141,15 @@ python3 inference.py --LORA_CHECKPOINT_DIR "path of model checkpoint" --output_f
 ```
 Example for testing: 
 ```
-python3 main.py --LORA_CHECKPOINT_DIR "./model/icews14" --output_file "./results/prediction_icews14.txt"  --input_file "./data/processed/eval/history_facts/history_facts_icews14.txt"  --test_ans_file "./data/processed/eval/test_answers/test_ans_icews14.csv"
+python3 main.py --LORA_CHECKPOINT_DIR "./model/icews14" --output_file "./results/prediction_icews14.txt"  --input_file "./data/processed/eval/history_facts/history_facts_icews14.txt"  --test_ans_file "./data/processed/eval/test_answers/test_ans_isccews14.csv"
+
+uv run inference.py --LORA_CHECKPOINT_DIR "./model/icews14" --output_file "./results/prediction_icews14_2.txt"  --input_file "./data/processed/eval/history_facts/history_facts_icews14.txt"  --test_ans_file "./data/processed/eval/test_answers/test_ans_icews14.txt"
+
+LLMDA
+uv run inference.py --LORA_CHECKPOINT_DIR "./model/icews14" --output_file "./results/llmda/prediction_icews14.txt"  --input_file "./data/processed_llmda/icews14/valid/history_facts/history_facts_icews14.txt"  --test_ans_file "./data/processed_llmda/icews14/valid/test_answers/test_answers_icews14.txt" >> logs/valid-llmda.log 2>&1
+
+
+
 ```
 Testing parameters (in eval_utils.py):
 

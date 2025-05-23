@@ -25,11 +25,11 @@ from transformers.generation.beam_constraints import DisjunctiveConstraint, Phra
 from transformers.generation.beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.generation.utils import (
-    GreedySearchEncoderDecoderOutput, 
-    GreedySearchDecoderOnlyOutput, 
+    GreedySearchEncoderDecoderOutput,
+    GreedySearchDecoderOnlyOutput,
     BeamSearchEncoderDecoderOutput,
     BeamSearchDecoderOnlyOutput,
-    )
+)
 from transformers.generation.logits_process import LogitsProcessorList
 from tqdm import tqdm
 import time
@@ -63,24 +63,35 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
 class Evaler:
-    def __init__(self, topk, tests, test_ans, 
-                 eval_txt_path, args, 
-                 model=None, tokenizer=None, patterns=None, 
-                 early_stop_chars=None, obligations=[]):
+    def __init__(
+        self,
+        topk,
+        tests,
+        test_ans,
+        eval_txt_path,
+        args,
+        model=None,
+        tokenizer=None,
+        patterns=None,
+        early_stop_chars=None,
+        obligations=[],
+    ):
         model_name = args.MODEL_NAME
         if not model or not tokenizer:
-            if 'llama' in model_name:
+            if "llama" in model_name:
                 self.llama = 1
-                llama2_directory = model_name.split('/models/')[0]
-                tokenizer_path = os.path.join(llama2_directory, 'tokenizer.model')
+                llama2_directory = model_name.split("/models/")[0]
+                tokenizer_path = os.path.join(llama2_directory, "tokenizer.model")
                 self.model, self.tokenizer = self.build(
-                    ckpt_dir = model_name,
+                    ckpt_dir=model_name,
                     tokenizer_path=tokenizer_path,
                     max_seq_len=args.max_seq_len,
                     max_batch_size=args.max_batch_size,
                 )
-            else: 
+            else:
                 self.llama = 0
                 self.model, self.tokenizer = init_neox(model_name)
         else:
@@ -92,21 +103,24 @@ class Evaler:
         self.test_ans = test_ans
         self.eval_txt_path = eval_txt_path
         self.topk = topk
-        
+
         self.args = args
 
         self.obligations = obligations
         self.constraints = []
-        self.zone_zero = early_stop_chars #in tensors. 0 is '\n', 29962 is ']'; self.tokenizer.encode(char) gives only a list
+        self.zone_zero = (
+            early_stop_chars  # in tensors. 0 is '\n', 29962 is ']'; self.tokenizer.encode(char) gives only a list
+        )
 
         self.first_check = 0
         self.top = 1
+
     def restrict_list_hard(self, tokens, prev_pos, min_prompt_len, input_text_mask, eos_reached, m=0):
         logits = self.model.forward(tokens[:, prev_pos:min_prompt_len], prev_pos)
         logits_last = logits[:, -1]
         # Get the index of the ten tokens of numbers
-        top_10_indices = torch.topk(logits_last, k=logits.shape[-1], dim=-1).indices 
-        values_to_extract = [29900, 29896, 29906, 29941, 29946, 29945, 29953, 29955, 29947, 29929] # 0-9 token
+        top_10_indices = torch.topk(logits_last, k=logits.shape[-1], dim=-1).indices
+        values_to_extract = [29900, 29896, 29906, 29941, 29946, 29945, 29953, 29955, 29947, 29929]  # 0-9 token
         top_10_indices_np = top_10_indices.cpu().numpy()
         mask = np.isin(top_10_indices_np, values_to_extract)
         extracted_elements = top_10_indices_np[mask][:10]
@@ -119,117 +133,120 @@ class Evaler:
         next_token = next_token.reshape(-1)
         # print('next token1: ', next_token)
 
-        next_token = torch.where(
-            input_text_mask[:, min_prompt_len], tokens[:, min_prompt_len], next_token
-            )
+        next_token = torch.where(input_text_mask[:, min_prompt_len], tokens[:, min_prompt_len], next_token)
 
         # In addition to getting the token, everything related to last_layer must be updated for the mode.forward of the next cycle
         tokens[:, min_prompt_len] = next_token
-        eos_reached |= (~input_text_mask[:, min_prompt_len]) & (
-                next_token == self.tokenizer.eos_id
-            )
-        
-        self.first_check = 1 #skip first_check
+        eos_reached |= (~input_text_mask[:, min_prompt_len]) & (next_token == self.tokenizer.eos_id)
+
+        self.first_check = 1  # skip first_check
         return next_token, eos_reached
-  
+
     def first_checking(self, next_tokens, next_tokens_scores):
         this_peer_finished = False
-        if self.first_check == 0: #first check
+        if self.first_check == 0:  # first check
             if self.obligations and (next_tokens not in self.obligations):
                 this_peer_finished = True
-                #need to force regenerate/reset next tokens to avoid the constraints
-                self.first_check = -1 #not begin with nums
+                # need to force regenerate/reset next tokens to avoid the constraints
+                self.first_check = -1  # not begin with nums
 
             if self.constraints and (next_tokens in self.constraints):
                 self.top += 1
-                #force regenerate/reset next tokens to avoid the constraints
-                next_tokens = torch.argsort(next_tokens_scores, dim=-1, descending=True)[:, self.top-1]
+                # force regenerate/reset next tokens to avoid the constraints
+                next_tokens = torch.argsort(next_tokens_scores, dim=-1, descending=True)[:, self.top - 1]
                 self.constraints.append(next_tokens)
-                self.first_check = -1 #breach of obligs
+                self.first_check = -1  # breach of obligs
             else:
                 self.constraints.append(next_tokens)
-                self.first_check = 1 #check sign passed
+                self.first_check = 1  # check sign passed
         return this_peer_finished, next_tokens
-      
-    def gen_set_ans(self, tests='', dir_full_test='', dir_time2id=''):
-        '''add non-duplicate answer for duplicate queries (no duplicates in sets); 
-            not require order a-z within one timestamp anymore
-                (to be used in Gdelt & Yago), but may need more time and space'''
-        if tests == '':
+
+    def gen_set_ans(self, tests="", dir_full_test="", dir_time2id=""):
+        """add non-duplicate answer for duplicate queries (no duplicates in sets);
+        not require order a-z within one timestamp anymore
+            (to be used in Gdelt & Yago), but may need more time and space"""
+        if tests == "":
             tests = self.tests
         dict_qu_ans = {}
-        if dir_full_test == '':
-            full_test_ans = self.test_ans #dense and time-well-divided dataset; icews14
-            for i in tqdm(range(0, len(tests)-1)):
-                query = tests[i].split('\n')[-1]
-                if query == '':
+        if dir_full_test == "":
+            full_test_ans = self.test_ans  # dense and time-well-divided dataset; icews14
+            for i in tqdm(range(0, len(tests) - 1)):
+                query = tests[i].split("\n")[-1]
+                if query == "":
                     break
                 if dict_qu_ans.get(query) == None:
                     dict_qu_ans[query] = set()
-                dict_qu_ans[query].add(full_test_ans[i]) #add answers to the set
+                dict_qu_ans[query].add(full_test_ans[i])  # add answers to the set
                 time.sleep(0.001)
         else:
             dict_t2id = {}
-            if dir_time2id != '':
+            if dir_time2id != "":
                 dict_t2id = read_json(dir_time2id)
             else:
                 print("Attention: icews18 needs its ts2id file to convert time into time_id")
-            fulltest = read_txt_as_list(dir_full_test) #only load essentially 
-            li_queries = [test.split('\n')[-1] for test in tests]
-            #build sets
-            for i in range(0, len(li_queries)-1):
+            fulltest = read_txt_as_list(dir_full_test)  # only load essentially
+            li_queries = [test.split("\n")[-1] for test in tests]
+            # build sets
+            for i in range(0, len(li_queries) - 1):
                 query = li_queries[i]
-                if query == '':
+                if query == "":
                     break
                 if dict_qu_ans.get(query) is None:
                     dict_qu_ans[query] = set()
-            end_time = li_queries[-3].split(':')[0]
+            end_time = li_queries[-3].split(":")[0]
             for line in fulltest:
-                quadruple = line.strip().split('\t')
-                time_quadruple = dict_t2id[quadruple[3]] if dir_time2id != '' else quadruple[3]
+                quadruple = line.strip().split("\t")
+                time_quadruple = dict_t2id[quadruple[3]] if dir_time2id != "" else quadruple[3]
                 if int(time_quadruple) > int(end_time):
                     break
                 built_query = f"{time_quadruple}: [{quadruple[0]}, {quadruple[1]},"
                 if dict_qu_ans.get(built_query) is not None:
-                    dict_qu_ans[built_query].add(quadruple[2]) #add answers to the set
+                    dict_qu_ans[built_query].add(quadruple[2])  # add answers to the set
             print("duplicate answers checked")
         return dict_qu_ans
-    
+
     def generate_extra_answers(self, m_inloop, k_inloop):
         if self.args.ft == 1:
-            raw_answers, answer_regs = self.model_calling(m_inloop) #call for more generated ans
-        elif self.llama == 1: #icl llama2
-            answer_regs = self.text_completion(m_inloop,  
-                                str(self.args.PROMPT),
-                                max_gen_len=self.args.max_gen_len,
-                                temperature=self.args.TEMPERATURE,
-                                #top_p=top_p,
-                            )
-            answer_regs = [answer_reg['generation'] for answer_reg in answer_regs]
+            raw_answers, answer_regs = self.model_calling(m_inloop)  # call for more generated ans
+        elif self.llama == 1:  # icl llama2
+            answer_regs = self.text_completion(
+                m_inloop,
+                str(self.args.PROMPT),
+                max_gen_len=self.args.max_gen_len,
+                temperature=self.args.TEMPERATURE,
+                # top_p=top_p,
+            )
+            answer_regs = [answer_reg["generation"] for answer_reg in answer_regs]
             raw_answers = answer_regs
-        else: #icl gpt neox
-            raw_answers = text_generation(m_inloop, k_inloop, self.model, self.tokenizer, 
-                                        str(self.args.PROMPT), 
-                                        #icews14 28, icews18 34, ecola 18, GDELT 16, YAGO 25. 
-                                        max_seq_len=34,
-                                        verbose=False)
-            pattern = re.compile(r'\s*(\d+)\.(.*?)\]')
-            answer_regs = re.match(pattern, raw_answers).group(2).strip() \
-                if re.match(pattern, raw_answers) else raw_answers
-            answer_regs = [answer_regs] 
+        else:  # icl gpt neox
+            raw_answers = text_generation(
+                m_inloop,
+                k_inloop,
+                self.model,
+                self.tokenizer,
+                str(self.args.PROMPT),
+                # icews14 28, icews18 34, ecola 18, GDELT 16, YAGO 25.
+                max_seq_len=34,
+                verbose=False,
+            )
+            pattern = re.compile(r"\s*(\d+)\.(.*?)\]")
+            answer_regs = (
+                re.match(pattern, raw_answers).group(2).strip() if re.match(pattern, raw_answers) else raw_answers
+            )
+            answer_regs = [answer_regs]
         return raw_answers, answer_regs
 
     def build(
-        self, 
+        self,
         ckpt_dir: str,
         tokenizer_path: str,
         max_seq_len: int,
         max_batch_size: int,
         model_parallel_size: Optional[int] = None,
-    ): 
-        os.environ["RANK"] = "0" # Set for torch.distributed.init_process_group
-        
-        #os.environ["WORLD_SIZE"] = "4" #  
+    ):
+        os.environ["RANK"] = "0"  # Set for torch.distributed.init_process_group
+
+        # os.environ["WORLD_SIZE"] = "4" #
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("nccl")
         if not model_parallel_is_initialized():
@@ -237,7 +254,7 @@ class Evaler:
                 model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
             initialize_model_parallel(model_parallel_size)
 
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        local_rank = int(os.environ.get("LOCAL_RANK", 1))  # TODO change
         torch.cuda.set_device(local_rank)
 
         # seed must be the same in all processes
@@ -269,10 +286,11 @@ class Evaler:
         model.load_state_dict(checkpoint, strict=False)
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
 
-        return model, tokenizer #Llama(model, tokenizer)
-    
+        return model, tokenizer  # Llama(model, tokenizer)
+
     def bs_generate(
-        self, m,
+        self,
+        m,
         prompt_tokens: List[List[int]],
         max_gen_len: int,
         temperature: float = 0.6,
@@ -280,7 +298,7 @@ class Evaler:
         logprobs: bool = False,
         echo: bool = False,
     ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
-        torch.no_grad() #replace @torch.inference_mode()
+        torch.no_grad()  # replace @torch.inference_mode()
 
         params = self.model.params
         bsz = len(prompt_tokens)
@@ -309,19 +327,18 @@ class Evaler:
                 reduction="none",
                 ignore_index=pad_id,
             )
-        if self.top <= 10 and m<10:
-            next_token, eos_reached = self.restrict_list_hard(tokens, 
-                                                              prev_pos, min_prompt_len, 
-                                                              input_text_mask, eos_reached, m)
+        if self.top <= 10 and m < 10:
+            next_token, eos_reached = self.restrict_list_hard(
+                tokens, prev_pos, min_prompt_len, input_text_mask, eos_reached, m
+            )
 
         prev_pos = min_prompt_len
         torch.set_printoptions(profile="full")
-        tokens = torch.where(tokens == -1, torch.tensor(0), tokens) 
-        
+        tokens = torch.where(tokens == -1, torch.tensor(0), tokens)
 
-        for cur_pos in range(min_prompt_len+1, total_len):
+        for cur_pos in range(min_prompt_len + 1, total_len):
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
-            
+
             if logprobs:
                 token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
                     input=logits.transpose(1, 2),
@@ -330,26 +347,22 @@ class Evaler:
                     ignore_index=pad_id,
                 )
 
-            top_sign = self.top-1 if self.first_check == 0 else 0 #first check, or to generate the rest
+            top_sign = self.top - 1 if self.first_check == 0 else 0  # first check, or to generate the rest
             next_token = torch.argsort(logits[:, -1], dim=-1, descending=True)[:, top_sign]
 
             this_peer_finished, next_token = self.first_checking(next_token, logits[:, -1])
 
             if next_token in self.zone_zero:
                 this_peer_finished = True
-            ## modification ends 
+            ## modification ends
             next_token = next_token.reshape(-1)
 
             # only replace token if prompt has already been generated
-            next_token = torch.where(
-                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
-            )
+            next_token = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token)
             tokens[:, cur_pos] = next_token
-            eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                next_token == self.tokenizer.eos_id
-            )
+            eos_reached |= (~input_text_mask[:, cur_pos]) & (next_token == self.tokenizer.eos_id)
             prev_pos = cur_pos
-            if all(eos_reached) or this_peer_finished: # added this_peer_finished
+            if all(eos_reached) or this_peer_finished:  # added this_peer_finished
                 break
 
         if logprobs:
@@ -370,31 +383,33 @@ class Evaler:
             out_tokens.append(toks)
             out_logprobs.append(probs)
         return (out_tokens, out_logprobs if logprobs else None)
-    
+
     def text_completion(
-        self, m, 
+        self,
+        m,
         prompts: List[str],
         temperature: float = 0,
         top_p: float = 0.1,
         max_gen_len: Optional[int] = None,
         logprobs: bool = False,
         echo: bool = False,
-    ): #-> List[CompletionPrediction]:
+    ):  # -> List[CompletionPrediction]:
         if max_gen_len is None:
             max_gen_len = self.model.params.max_seq_len - 1
         prompt_tokens = [self.tokenizer.encode(prompts, bos=True, eos=False)]
-        '''
+        """
         for x in prompts:
             print(x)
-            prompt_tokens.append(self.tokenizer.encode(x, bos=False, eos=False))'''
-        generation_tokens, generation_logprobs = self.bs_generate(m, 
-                                                                prompt_tokens,
-                                                                max_gen_len,
-                                                                temperature,
-                                                                top_p,
-                                                                logprobs,
-                                                                echo,
-                                                            )
+            prompt_tokens.append(self.tokenizer.encode(x, bos=False, eos=False))"""
+        generation_tokens, generation_logprobs = self.bs_generate(
+            m,
+            prompt_tokens,
+            max_gen_len,
+            temperature,
+            top_p,
+            logprobs,
+            echo,
+        )
         if logprobs:
             return [
                 {
@@ -406,21 +421,20 @@ class Evaler:
             ]
         return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
 
-
     def my_generate_top10(self, model_instance, m, gen_length, **kwargs):
         base_model = model_instance.base_model
-        
+
         # original prepare_inputs_for_generation and generation_config
         original_prepare_inputs_for_generation = base_model.prepare_inputs_for_generation
         original_generation_config = getattr(base_model, "generation_config", None)
-        
+
         # prepare_inputs_for_generation and generation_config
         base_model.prepare_inputs_for_generation = model_instance.prepare_inputs_for_generation
         if hasattr(base_model, "model"):
             base_model.model.generation_config = model_instance.generation_config
         else:
             base_model.generation_config = model_instance.generation_config
-        
+
         try:
             # base_model generate_top10
             outputs = self.my_utils_generate_top10(base_model, m, gen_length, **kwargs)
@@ -441,8 +455,10 @@ class Evaler:
 
     # adopted from "generate" in /transformers/generation/utils.py
     @torch.no_grad()
-    def my_utils_generate_top10(self, 
-        model_instance,  m, 
+    def my_utils_generate_top10(
+        self,
+        model_instance,
+        m,
         gen_length,
         inputs: Optional[torch.Tensor] = None,
         generation_config: Optional[GenerationConfig] = None,
@@ -454,8 +470,8 @@ class Evaler:
         assistant_model: Optional["PreTrainedModel"] = None,
         streamer: Optional["BaseStreamer"] = None,
         **kwargs,
-    ): #-> Union[GenerateOutput, torch.LongTensor]:
-        
+    ):  # -> Union[GenerateOutput, torch.LongTensor]:
+
         if synced_gpus is None:
             if is_deepspeed_zero3_enabled() and dist.get_world_size() > 1:
                 synced_gpus = True
@@ -717,7 +733,9 @@ class Evaler:
                 assistant_model=assistant_model,
                 do_sample=generation_config.do_sample,
                 logits_processor=logits_processor,
-                logits_warper=model_instance._get_logits_warper(generation_config) if generation_config.do_sample else None,
+                logits_warper=(
+                    model_instance._get_logits_warper(generation_config) if generation_config.do_sample else None
+                ),
                 stopping_criteria=stopping_criteria,
                 pad_token_id=generation_config.pad_token_id,
                 eos_token_id=generation_config.eos_token_id,
@@ -734,13 +752,14 @@ class Evaler:
                     f"but is {generation_config.num_return_sequences}."
                 )
             # 11. run greedy search
-            return self.my_utils_greedy_search_top10(model_instance,  #my_utils_greedy_search_top10
-                m,              #check m
-                gen_length, 
-                input_ids, 
+            return self.my_utils_greedy_search_top10(
+                model_instance,  # my_utils_greedy_search_top10
+                m,  # check m
+                gen_length,
+                input_ids,
                 logits_processor=logits_processor,
                 stopping_criteria=stopping_criteria,
-                # max_length=20, 
+                # max_length=20,
                 pad_token_id=generation_config.pad_token_id,
                 eos_token_id=generation_config.eos_token_id,
                 output_scores=generation_config.output_scores,
@@ -1012,10 +1031,11 @@ class Evaler:
                 **model_kwargs,
             )
 
-    # adopted from "greedy_search" in /transformers/generation/utils.py 
-    def my_utils_greedy_search_top10(self, 
+    # adopted from "greedy_search" in /transformers/generation/utils.py
+    def my_utils_greedy_search_top10(
+        self,
         model_instance,
-        m_inloop, 
+        m_inloop,
         gen_length,
         input_ids: torch.LongTensor,
         logits_processor: Optional[LogitsProcessorList] = None,
@@ -1030,12 +1050,12 @@ class Evaler:
         synced_gpus: bool = False,
         streamer: Optional["BaseStreamer"] = None,
         **model_kwargs,
-    ): #-> Union[GreedySearchOutput, torch.LongTensor]:
+    ):  # -> Union[GreedySearchOutput, torch.LongTensor]:
         r"""
         ["It might be possible to get a better understanding of the nature of the problem, but it's not"]
         ```"""
         # init values
-        stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=gen_length+input_ids.shape[1])])
+        stopping_criteria = StoppingCriteriaList([MaxLengthCriteria(max_length=gen_length + input_ids.shape[1])])
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
         if max_length is not None:
@@ -1055,14 +1075,15 @@ class Evaler:
             output_attentions if output_attentions is not None else model_instance.generation_config.output_attentions
         )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else model_instance.generation_config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else model_instance.generation_config.output_hidden_states
         )
         return_dict_in_generate = (
             return_dict_in_generate
             if return_dict_in_generate is not None
             else model_instance.generation_config.return_dict_in_generate
         )
-
 
         # init attention / hidden states / scores tuples
         scores = () if (return_dict_in_generate and output_scores) else None
@@ -1081,8 +1102,6 @@ class Evaler:
         unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
 
         this_peer_finished = False  # used by synced_gpus only
-
-
 
         # prepare model initial inputs
         model_inputs = model_instance.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -1138,9 +1157,7 @@ class Evaler:
             unfinished_sequences = unfinished_sequences.mul(
                 next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
             )
-            
 
-    
         while True:
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
@@ -1151,7 +1168,7 @@ class Evaler:
                 # did all peers finish? the reduced sum will be 0.0 then
                 if this_peer_finished_flag.item() == 0.0:
                     break
-            
+
             # prepare model inputs
             model_inputs = model_instance.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
@@ -1162,7 +1179,6 @@ class Evaler:
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
             )
-
 
             if synced_gpus and this_peer_finished:
                 continue  # don't waste resources running the code we don't need
@@ -1178,7 +1194,9 @@ class Evaler:
                     scores += (next_tokens_scores,)
                 if output_attentions:
                     decoder_attentions += (
-                        (outputs.decoder_attentions,) if model_instance.config.is_encoder_decoder else (outputs.attentions,)
+                        (outputs.decoder_attentions,)
+                        if model_instance.config.is_encoder_decoder
+                        else (outputs.attentions,)
                     )
                     if model_instance.config.is_encoder_decoder:
                         cross_attentions += (outputs.cross_attentions,)
@@ -1190,11 +1208,11 @@ class Evaler:
                         else (outputs.hidden_states,)
                     )
 
-            top_sign = self.top-1 if self.first_check == 0 else 0 #first check, or to generate the rest
+            top_sign = self.top - 1 if self.first_check == 0 else 0  # first check, or to generate the rest
             next_tokens = torch.argsort(next_tokens_scores, dim=-1, descending=True)[:, top_sign]
 
             this_peer_finished, next_tokens = self.first_checking(next_tokens, next_tokens_scores)
-            
+
             if next_tokens in self.zone_zero:
                 this_peer_finished = True
 
@@ -1252,7 +1270,7 @@ class Evaler:
                 )
         else:
             return input_ids
-        
+
     def require_first_to_be(self, next_tokens_scores, values_to_extract=[29871]):
         top_k_indices = torch.topk(next_tokens_scores, k=next_tokens_scores.shape[-1], dim=-1).indices
         top_k_indices_np = top_k_indices.cpu().numpy()
@@ -1262,12 +1280,13 @@ class Evaler:
 
         next_tokens = top_k_indices.item()
         next_tokens = torch.tensor(next_tokens).reshape(-1)
-        current_device = torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
+        current_device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
         return next_tokens.to(current_device), top_k_indices.to(current_device)
-    
-    def my_utils_greedy_search_top10_recursive(self, 
+
+    def my_utils_greedy_search_top10_recursive(
+        self,
         model_instance,
-        m_inloop, 
+        m_inloop,
         gen_length,
         input_ids: torch.LongTensor,
         logits_processor: Optional[LogitsProcessorList] = None,
@@ -1285,7 +1304,7 @@ class Evaler:
     ):
         # init values
         print("another day, another destiny")
-        stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=gen_length+input_ids.shape[1])])
+        stopping_criteria = StoppingCriteriaList([MaxLengthCriteria(max_length=gen_length + input_ids.shape[1])])
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
         if max_length is not None:
@@ -1305,7 +1324,9 @@ class Evaler:
             output_attentions if output_attentions is not None else model_instance.generation_config.output_attentions
         )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else model_instance.generation_config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else model_instance.generation_config.output_hidden_states
         )
         return_dict_in_generate = (
             return_dict_in_generate
@@ -1317,10 +1338,12 @@ class Evaler:
         decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
         cross_attentions = () if (return_dict_in_generate and output_attentions) else None
         decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
-        dict_parameter_return = {"scores":scores, 
-                                 "decoder_attentions":decoder_attentions, 
-                                 "cross_attentions":cross_attentions, 
-                                 "decoder_hidden_states":decoder_hidden_states} 
+        dict_parameter_return = {
+            "scores": scores,
+            "decoder_attentions": decoder_attentions,
+            "cross_attentions": cross_attentions,
+            "decoder_hidden_states": decoder_hidden_states,
+        }
 
         if return_dict_in_generate and model_instance.config.is_encoder_decoder:
             encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
@@ -1330,10 +1353,10 @@ class Evaler:
 
         unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
         this_peer_finished = False
-        #end initialization 
+        # end initialization
 
         model_inputs = model_instance.prepare_inputs_for_generation(input_ids, **model_kwargs)
-        #most time consuming part:
+        # most time consuming part:
         outputs = model_instance(
             **model_inputs,
             return_dict=True,
@@ -1379,14 +1402,16 @@ class Evaler:
             unfinished_sequences = unfinished_sequences.mul(
                 next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
             )
-        #Time consume: 6-7s
+        # Time consume: 6-7s
 
-        def _recursive_greedy_search_top10(input_ids, 
-                                           model_kwargs, 
-                                           unfinished_sequences, 
-                                           this_peer_finished, 
-                                           eos_token_id_tensor, 
-                                           dict_parameter_return):
+        def _recursive_greedy_search_top10(
+            input_ids,
+            model_kwargs,
+            unfinished_sequences,
+            this_peer_finished,
+            eos_token_id_tensor,
+            dict_parameter_return,
+        ):
             def _get_outputs():
                 model_inputs = model_instance.prepare_inputs_for_generation(input_ids, **model_kwargs)
                 outputs = model_instance(
@@ -1396,8 +1421,8 @@ class Evaler:
                     output_hidden_states=output_hidden_states,
                 )
                 return outputs
-            
-            #Base
+
+            # Base
             if synced_gpus:
                 this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(input_ids.device)
                 dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
@@ -1405,7 +1430,7 @@ class Evaler:
                     return input_ids
             if this_peer_finished and not synced_gpus:
                 return input_ids
-            
+
             outputs = _get_outputs()
             next_token_logits = outputs.logits[:, -1, :]
             next_tokens_scores = logits_processor(input_ids, next_token_logits)
@@ -1415,7 +1440,9 @@ class Evaler:
                     dict_parameter_return["scores"] += (next_tokens_scores,)
                 if output_attentions:
                     dict_parameter_return["decoder_attentions"] += (
-                        (outputs.decoder_attentions,) if model_instance.config.is_encoder_decoder else (outputs.attentions,)
+                        (outputs.decoder_attentions,)
+                        if model_instance.config.is_encoder_decoder
+                        else (outputs.attentions,)
                     )
                     if model_instance.config.is_encoder_decoder:
                         dict_parameter_return["cross_attentions"] += (outputs.cross_attentions,)
@@ -1427,14 +1454,14 @@ class Evaler:
                         else (outputs.hidden_states,)
                     )
 
-            top_sign = self.top-1 if self.first_check == 0 else 0
+            top_sign = self.top - 1 if self.first_check == 0 else 0
             next_tokens = torch.argsort(next_tokens_scores, dim=-1, descending=True)[:, top_sign]
 
             this_peer_finished, next_tokens = self.first_checking(next_tokens, next_tokens_scores)
 
             if next_tokens in self.zone_zero:
                 this_peer_finished = True
-                
+
             # finished sentences should have their next token be a padding token
             if eos_token_id is not None:
                 if pad_token_id is None:
@@ -1459,18 +1486,25 @@ class Evaler:
 
             if stopping_criteria(input_ids, dict_parameter_return["scores"]):
                 this_peer_finished = True
-            #recursion
-            return _recursive_greedy_search_top10(input_ids, 
-                                           model_kwargs, 
-                                           unfinished_sequences, 
-                                           this_peer_finished, 
-                                           eos_token_id_tensor, 
-                                           dict_parameter_return)
-        
-        #main cur begins
-        input_ids = _recursive_greedy_search_top10(input_ids, model_kwargs, unfinished_sequences,
-                                                   this_peer_finished, eos_token_id_tensor,
-                                                   dict_parameter_return)
+            # recursion
+            return _recursive_greedy_search_top10(
+                input_ids,
+                model_kwargs,
+                unfinished_sequences,
+                this_peer_finished,
+                eos_token_id_tensor,
+                dict_parameter_return,
+            )
+
+        # main cur begins
+        input_ids = _recursive_greedy_search_top10(
+            input_ids,
+            model_kwargs,
+            unfinished_sequences,
+            this_peer_finished,
+            eos_token_id_tensor,
+            dict_parameter_return,
+        )
 
         if streamer is not None:
             streamer.end()
@@ -1495,68 +1529,71 @@ class Evaler:
                 )
         else:
             return input_ids
-    
+
     def model_calling(self, m_inloop):
         ids = self.tokenizer.encode(self.args.PROMPT)
-        input_ids = torch.LongTensor([ids]).to('cuda')
-        self.first_check = 0 #set check sign = 0 first
-        out = self.my_generate_top10(model_instance=self.model, m=m_inloop, #m_inloop useless here now
-                                input_ids=input_ids,
-                                max_length=self.args.CONTEXT_LEN,
-                                gen_length=36,
-                                do_sample=False, #with temperature unset
-                                #temperature=self.args.TEMPERATURE
-                                )
+        input_ids = torch.LongTensor([ids]).to("cuda")
+        self.first_check = 0  # set check sign = 0 first
+        out = self.my_generate_top10(
+            model_instance=self.model,
+            m=m_inloop,  # m_inloop useless here now
+            input_ids=input_ids,
+            max_length=self.args.CONTEXT_LEN,
+            gen_length=36,
+            do_sample=False,  # with temperature unset
+            # temperature=self.args.TEMPERATURE
+        )
         out_text = self.tokenizer.decode(out[0])
         answer = out_text.replace(self.args.PROMPT, "").replace("\nEND", "").strip()
         answer = answer.replace("\n", "")
 
-        answer_regs = [re.match(pattern, answer).group(1) if re.match(pattern, answer) else answer \
-                     for pattern in self.patterns]
+        answer_regs = [
+            re.match(pattern, answer).group(1) if re.match(pattern, answer) else answer for pattern in self.patterns
+        ]
         return answer, answer_regs
-    
-    #@blockPrinting
+
+    # @blockPrinting
     def eval(self, c, cnt=0, path_results=None, filter_yes=True):
         query = ""
         c1 = c["c1"]
         c3 = c["c3"]
         c10 = c["c10"]
-            
-        if path_results is not None: #for processing result files
+
+        if path_results is not None:  # for processing result files
             test_results = read_results(path_results)
-        #preprocess multiple answers
+        # preprocess multiple answers
         dict_qu_ans = self.gen_set_ans(dir_full_test=self.args.fulltest, dir_time2id=self.args.time2id)
         set_checked_qu = set()
-        num_infer = len(self.tests) #
+        num_infer = len(self.tests)  #
         for i in tqdm(range(cnt, num_infer)):  # cnt, len(self.tests[:-1])
             his_query = self.tests[i]
-            query = his_query.split('\n')[-1]
-            #truncated history
+            query = his_query.split("\n")[-1]
+            # truncated history
             val_trunc = -1
-            if len(his_query)-1 > val_trunc and val_trunc != -1: 
-                li_his_trunc = his_query.split('\n')[-val_trunc-1:-1] #backward
+            if len(his_query) - 1 > val_trunc and val_trunc != -1:
+                li_his_trunc = his_query.split("\n")[-val_trunc - 1 : -1]  # backward
                 li_his_trunc.append(query)
                 his_query = "\n".join(li_his_trunc)
 
             delete = False
-            if delete == True: 
-                his_query = re.sub(r'\d+:\s', '', his_query)
+            if delete == True:
+                his_query = re.sub(r"\d+:\s", "", his_query)
 
-            ins = '''<s>[INST] <<SYS>> \
+            ins = """<s>[INST] <<SYS>> \
             You must be able to correctly predict the next {object_label} from \
             a given text consisting of multiple quadruplets in the form of "{time}:[{subject}, {relation}, {object_label}.{object}]" \
             and the query in the form of "{time}:[{subject}, {relation}," in the end.\n\
-            You must generate {object_label}.{object}\n\n<</SYS>>'''
-            self.args.PROMPT = ins + his_query + '[/INST]' if self.args.instruct_yes else his_query
+            You must generate {object_label}.{object}\n\n<</SYS>>"""
+            self.args.PROMPT = ins + his_query + "[/INST]" if self.args.instruct_yes else his_query
 
             if query not in set_checked_qu:
                 set_checked_qu.add(query)
                 hello = "For"
-                
+
             else:
                 hello = "Duplicate query:"
             print(hello, query)
-            if query == '': #probably the end 
+            if query == "":  # probably the end
                 continue
             print("Given answers", dict_qu_ans[query], "with", self.test_ans[i], "as the gt")
 
@@ -1566,23 +1603,23 @@ class Evaler:
             filter_m_count = -1
             k_inloop = self.topk  # k
             self.constraints = []
-            self.top = 1 #reset top
-            exist_num = 0   
-            if path_results is not None: #for processing result files
+            self.top = 1  # reset top
+            exist_num = 0
+            if path_results is not None:  # for processing result files
                 num_Test, li_results = read_num_and_li_results(test_results[i])
                 exist_num = len(li_results)
                 if int(num_Test) != i:
                     print(num_Test, i)
                     raise ValueError("Test id and i do not match.")
-            while m_inloop < k_inloop-1:  # Use while to allow changing "m"
+            while m_inloop < k_inloop - 1:  # Use while to allow changing "m"
                 m_inloop += 1
                 filter_m_count += 1
-                with torch.no_grad(): #loops for one history_query
-                    if path_results is None: #or self.args.ft==1
-                        raw_ans, answer_regs = self.model_calling(m_inloop) 
+                with torch.no_grad():  # loops for one history_query
+                    if path_results is None:  # or self.args.ft==1
+                        raw_ans, answer_regs = self.model_calling(m_inloop)
                         print(str(m_inloop) + "-th time, I would say, ", answer_regs)
                     else:
-                        
+
                         if m_inloop >= exist_num:
                             if not filter_yes:
                                 break
@@ -1591,30 +1628,35 @@ class Evaler:
                                 raw_ans, answer_regs = self.generate_extra_answers(m_inloop, k_inloop)
                                 print(str(m_inloop) + "-th time, I would say, ", answer_regs)
                         else:
-                            #existing results
-                            raw_ans = answer_regs = [li_results[m_inloop]] 
-                            pattern = re.compile(r'.*?[\d:@][._](.*)\]') #'\s*(\d+)\.(.*?)\]')
-                            answer_regs = [re.match(pattern, answer_regs[0]).group(2).strip()] \
-                                if re.match(pattern, answer_regs[0]) else answer_regs
+                            # existing results
+                            raw_ans = answer_regs = [li_results[m_inloop]]
+                            pattern = re.compile(r".*?[\d:@][._](.*)\]")  #'\s*(\d+)\.(.*?)\]')
+                            answer_regs = (
+                                [re.match(pattern, answer_regs[0]).group(2).strip()]
+                                if re.match(pattern, answer_regs[0])
+                                else answer_regs
+                            )
                             print(str(m_inloop) + " read ", answer_regs)
                             self.top += 1
 
-                    content_to_write.append('\n' + str(answer_regs))
-                    content_to_write2.append('\n' + str(raw_ans))
+                    content_to_write.append("\n" + str(answer_regs))
+                    content_to_write2.append("\n" + str(raw_ans))
 
-                    #check multiple regex 
+                    # check multiple regex
                     bingo = False
                     dict_qu_ans_lower = [ans.lower() for ans in dict_qu_ans[query]]
                     for answer in answer_regs:
                         answerlow = answer.lower()
                         gtlow = self.test_ans[i].lower()
-                        if answer == '':
+                        if answer == "":
                             content_to_write.append("(none string; removed)")
                             k_inloop += 1
                             filter_m_count -= 1
                             print("increased k: " + str(k_inloop))
                             break
-                        if (answerlow != gtlow and answerlow in dict_qu_ans_lower) and filter_yes: #first_check = -1 if to check breach of obligation
+                        if (
+                            answerlow != gtlow and answerlow in dict_qu_ans_lower
+                        ) and filter_yes:  # first_check = -1 if to check breach of obligation
                             print("Got another answer: " + answer + ", ignored.")
                             content_to_write.append("(ignored gt)")
                             k_inloop += 1
@@ -1632,8 +1674,18 @@ class Evaler:
                                 c10 += 1
                             elif 3 <= filter_m_count < 10:
                                 c10 += 1
-                            print("Bingo! Line: ", i, "count after filtering: ", filter_m_count + 1, "all count: ", \
-                            m_inloop + 1, "answer: ", answer, "gt: ", self.test_ans[i])
+                            print(
+                                "Bingo! Line: ",
+                                i,
+                                "count after filtering: ",
+                                filter_m_count + 1,
+                                "all count: ",
+                                m_inloop + 1,
+                                "answer: ",
+                                answer,
+                                "gt: ",
+                                self.test_ans[i],
+                            )
                             break
                     if bingo:
                         break
@@ -1641,17 +1693,17 @@ class Evaler:
             hits_1 = c1 / (i + 1)
             hits_3 = c3 / (i + 1)
             hits_10 = c10 / (i + 1)
-            '''
+            """
             print("hit1=", c1, "/", str(i+1), "=", hits_1)
             print("hit3=", c3, "/", str(i+1), "=", hits_3)
-            print("hit10=", c10, "/", str(i+1), "=", hits_10)'''
+            print("hit10=", c10, "/", str(i+1), "=", hits_10)"""
 
             with open(self.eval_txt_path, "a", encoding="utf-8") as fout:
                 if self.args.ft == 1:
-                    fout.write('current model: ' + self.args.LORA_CHECKPOINT_DIR + ', \n')
+                    fout.write("current model: " + self.args.LORA_CHECKPOINT_DIR + ", \n")
                 else:
-                    fout.write('current model: ' + self.args.MODEL_NAME + ', \n')
-                fout.write(self.args.output_file + ' currently finished: ' + str(i + 1) + '; results: \n')
+                    fout.write("current model: " + self.args.MODEL_NAME + ", \n")
+                fout.write(self.args.output_file + " currently finished: " + str(i + 1) + "; results: \n")
                 fout.write("Hits@1: " + str(round(hits_1, 3)) + "\n")
                 fout.write("Hits@3: " + str(round(hits_3, 3)) + "\n")
                 fout.write("Hits@10: " + str(round(hits_10, 3)) + "\n")
@@ -1659,10 +1711,10 @@ class Evaler:
                 fout.write(str(c3) + "\n")
                 fout.write(str(c10) + "\n\n")
 
-            with open(self.args.output_file, 'a', encoding='utf-8') as f:
-                f.write('{"Test'+str(i)+'": ["' + ', '.join(content_to_write) + '"]}, \n\n')
-            with open(self.args.output_file.replace(".txt", "_raw.txt"), 'a', encoding='utf-8') as f:
-                f.write('{"Test'+str(i)+'": ["' + ', '.join(content_to_write2) + '"]}, \n\n')
+            with open(self.args.output_file, "a", encoding="utf-8") as f:
+                f.write('{"Test' + str(i) + '": ["' + ", ".join(content_to_write) + '"]}, \n\n')
+            with open(self.args.output_file.replace(".txt", "_raw.txt"), "a", encoding="utf-8") as f:
+                f.write('{"Test' + str(i) + '": ["' + ", ".join(content_to_write2) + '"]}, \n\n')
 
-            print('processing: ' + self.args.output_file, i + 1)
+            print("processing: " + self.args.output_file, i + 1)
             time.sleep(0.001)

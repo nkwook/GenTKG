@@ -1,0 +1,25 @@
+[project]
+name = "GenTKG"
+version = "0.1.0"
+description = "GenTKG project dependencies"
+authors = [
+    { name = "Your Name", email = "you@example.com" },
+]
+dependencies = [
+    "datasets==2.13.1",
+    "torch==2.4.0",
+    "fairscale==0.4.13",
+    "fire==0.5.0",
+    "numpy<2",
+    "tokenizers",
+    "transformers==4.35.2",
+    "tqdm",
+    "wandb==0.16.0",
+    "sentencepiece",
+    "peft==0.10",
+    "PyYAML==6.0.1",
+    "setuptools",
+    "bitsandbytes==0.41.0",
+    "scipy",
+]
+requires-python = ">=3.10, <3.13"
