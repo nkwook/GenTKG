@@ -254,7 +254,7 @@ class Evaler:
                 model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
             initialize_model_parallel(model_parallel_size)
 
-        local_rank = int(os.environ.get("LOCAL_RANK", 1))  # TODO change
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))  # TODO change
         torch.cuda.set_device(local_rank)
 
         # seed must be the same in all processes
@@ -1565,9 +1565,14 @@ class Evaler:
         dict_qu_ans = self.gen_set_ans(dir_full_test=self.args.fulltest, dir_time2id=self.args.time2id)
         set_checked_qu = set()
         num_infer = len(self.tests)  #
+
+        valid_cnt = 0
         for i in tqdm(range(cnt, num_infer)):  # cnt, len(self.tests[:-1])
             his_query = self.tests[i]
             query = his_query.split("\n")[-1]
+            if len(his_query.split("\n")) < 5:
+                continue  # TODO: 충분한 retrieval이 되지 않은 경우 생략하는 옵션
+            valid_cnt += 1
             # truncated history
             val_trunc = -1
             if len(his_query) - 1 > val_trunc and val_trunc != -1:
@@ -1690,13 +1695,27 @@ class Evaler:
                     if bingo:
                         break
 
-            hits_1 = c1 / (i + 1)
-            hits_3 = c3 / (i + 1)
-            hits_10 = c10 / (i + 1)
+            # hits_1 = c1 / (i + 1)
+            # hits_3 = c3 / (i + 1)
+            # hits_10 = c10 / (i + 1)
+
+            hits_1 = c1 / valid_cnt
+            hits_3 = c3 / valid_cnt
+            hits_10 = c10 / valid_cnt
             """
             print("hit1=", c1, "/", str(i+1), "=", hits_1)
             print("hit3=", c3, "/", str(i+1), "=", hits_3)
             print("hit10=", c10, "/", str(i+1), "=", hits_10)"""
+
+            # Create parent directories if they don't exist
+            eval_txt_dir = os.path.dirname(self.eval_txt_path)
+            if eval_txt_dir and not os.path.exists(eval_txt_dir):
+                os.makedirs(eval_txt_dir, exist_ok=True)
+
+            # Create the txt file if it doesn't exist
+            if not os.path.exists(self.eval_txt_path):
+                with open(self.eval_txt_path, "w", encoding="utf-8") as f:
+                    f.write("")  # Create empty file
 
             with open(self.eval_txt_path, "a", encoding="utf-8") as fout:
                 if self.args.ft == 1:

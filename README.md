@@ -72,7 +72,7 @@ Find the file name of rule bank json (in ./output) and run from the folder GenTK
 ```
 cd GenTKG
 python3 ./data_utils/retrieve.py --name_of_rules_file name_rules.json --dataset icews14
-uv run ./data_utils/retrieve.py --name_of_rules_file llm-da-rules.json --dataset icews14 
+uv run ./data_utils/retrieve.py --name_of_rules_file confidence.json --dataset icews14 -s ./data/processed_rule2
 uv run ./data_utils/retrieve.py --name_of_rules_file 080823105650_r[1,2,3]_n200_exp_s12_rules.json --dataset icews14 
 ```
 An example for icews18 would be like:
@@ -146,8 +146,11 @@ python3 main.py --LORA_CHECKPOINT_DIR "./model/icews14" --output_file "./results
 uv run inference.py --LORA_CHECKPOINT_DIR "./model/icews14" --output_file "./results/prediction_icews14_2.txt"  --input_file "./data/processed/eval/history_facts/history_facts_icews14.txt"  --test_ans_file "./data/processed/eval/test_answers/test_ans_icews14.txt"
 
 LLMDA
-uv run inference.py --LORA_CHECKPOINT_DIR "./model/icews14" --output_file "./results/llmda/prediction_icews14.txt"  --input_file "./data/processed_llmda/icews14/valid/history_facts/history_facts_icews14.txt"  --test_ans_file "./data/processed_llmda/icews14/valid/test_answers/test_answers_icews14.txt" >> logs/valid-llmda.log 2>&1
+uv run inference.py --LORA_CHECKPOINT_DIR "./model/icews14" --output_file "./results/llmda_new_rule/prediction_icews14.txt"  --input_file "./data/processed_rule2/icews14/test/history_facts/history_facts_icews14.txt"  --test_ans_file "./data/processed_rule2/icews14/test/test_answers/test_answers_icews14.txt" >> logs/test-llmda-rule3.log 2>&1
 
+
+LLMDA with prompt
+uv run inference.py --LORA_CHECKPOINT_DIR "./model/icews14" --output_file "./results/llmda_ins/prediction_icews14.txt"  --input_file "./data/processed_llmda/icews14/test/history_facts/history_facts_icews14.txt"  --test_ans_file "./data/processed_llmda/icews14/test/test_answers/test_answers_icews14.txt" --instruct_yes 1 >> logs/test-llmda-ins.log 2>&1
 
 
 ```

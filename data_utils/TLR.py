@@ -102,13 +102,14 @@ class Retriever:
         time = self.times_id[
             test_time
         ]  # To move forward the time according to the id corresponding relationship of time. Get int from str
-        return s_0, s_t, head_rel, time, test_sub, test_rel
+        return s_0, s_t, head_rel, int(time), test_sub, test_rel
 
     def build_tl(self):
         test_text = []
         test_idx = []
 
         for i in tqdm(range(0, len(self.test))):  # Starting from 1 because there is a header. 1, len(test)
+
             num_facts = 50  # Set it again for each question, as the following may change.
             s_0, s_t, head_rel, time, test_sub, test_rel = self.tlogic_prepro(i)
             facts = []
@@ -116,7 +117,9 @@ class Retriever:
 
             if not str(head_rel) in self.chains:  # If the test relation has no chain, nothing will be done.
                 # l = ['Just repeat "No Chains."\n']
-                history_query = [str(time) + ": [" + test_sub + ", " + test_rel + ",\n"]
+                history_query = [
+                    str(int(time / 24)) + ": [" + test_sub + ", " + test_rel + ",\n"
+                ]  # TODO : 24로 나누는 부분 추가함
                 test_idx.append([])  # At this time idx is a blank line
                 test_text.append(history_query)
                 # print(i, 'no chain in this line')
@@ -184,7 +187,7 @@ class Retriever:
             obj_in_word = fact[2]
             id_obj = self.entities[obj_in_word]
             histories = histories + [
-                str(int(time_in_id) / int(period))
+                str(int(int(time_in_id) / int(period)))
                 + ": ["
                 + sub_in_word
                 + ", "
@@ -203,9 +206,10 @@ class Retriever:
             period = 24
         # time_in_id = self.times_id[time]  # TODO: 이미 id형태의 time이 나와서 로직 변경함.
         time_in_id = time
+
         return [
             "".join(histories)
-            + str(int(time_in_id) / int(period))
+            + str(int(int(time_in_id) / int(period)))
             + ": ["
             + test_sub
             + ", "

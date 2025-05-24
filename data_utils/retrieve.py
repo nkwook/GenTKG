@@ -44,12 +44,13 @@ if __name__ == "__main__":
     test_ans = []
 
     # open files:
-    li_files = [
-        "train",
-        "valid",
-        "test",
-    ]  #  ['train','valid','test'] or  ['test'] when only test set is needed # TODO - revert
-    # li_files = ["valid", "test"]  #  ['train','valid','test'] or  ['test'] when only test set is needed
+    # li_files = [
+    #     "train",
+    #     "valid",
+    #     "test",
+    # ]
+    # #  ['train','valid','test'] or  ['test'] when only test set is needed # TODO - revert
+    li_files = ["test"]  #  ['train','valid','test'] or  ['test'] when only test set is needed
 
     for files in li_files:
         print("existing rules:", glob.glob(path_out_tl + "*rules.json"))
